@@ -545,12 +545,16 @@ int BPFtrace::run(std::unique_ptr<BpfOrc> bpforc)
   if (epollfd < 0)
     return epollfd;
 
+  int spawn_delay_fd = -1; // if not -1, close when probes are initilaized to launch the command
+
   // Spawn a child process if we've been passed a command to run
   if (cmd_.size())
   {
     auto args = split_string(cmd_, ' ');
     args[0] = resolve_binary_path(args[0]);  // does path lookup on executable
-    int pid = spawn_child(args);
+    auto child_vars = spawn_child(args);
+    int pid = child_vars.first;
+    spawn_delay_fd = child_vars.second;
     if (pid < 0)
     {
       std::cerr << "Failed to spawn child=" << cmd_ << std::endl;
@@ -574,6 +578,9 @@ int BPFtrace::run(std::unique_ptr<BpfOrc> bpforc)
       return -1;
     attached_probes_.push_back(std::move(attached_probe));
   }
+
+  if (spawn_delay_fd != -1)
+    close(spawn_delay_fd);
 
   if (bt_verbose)
     std::cerr << "Running..." << std::endl;
@@ -1234,10 +1241,11 @@ int BPFtrace::print_lhist(const std::vector<uint64_t> &values, int min, int max,
   return 0;
 }
 
-int BPFtrace::spawn_child(const std::vector<std::string>& args)
+std::pair<int, int> BPFtrace::spawn_child(const std::vector<std::string>& args)
 {
   static const int maxargs = 256;
   char* argv[maxargs];
+  int pipefds[2];
 
   // Convert vector of strings into raw array of C-strings for execve(2)
   int idx = 0;
@@ -1247,13 +1255,19 @@ int BPFtrace::spawn_child(const std::vector<std::string>& args)
     {
       std::cerr << "Too many args passed into spawn_child (" << args.size()
         << " > " << maxargs - 1 << ")" << std::endl;
-      return -1;
+      return std::make_pair(-1, -1);
     }
 
     argv[idx] = const_cast<char*>(arg.c_str());
     ++idx;
   }
   argv[idx] = nullptr;  // must be null terminated
+
+  if (pipe(pipefds) != 0)
+  {
+    perror("pipe");
+    return std::make_pair(-1, -1);
+  }
 
   // Fork and exec
   int ret = fork();
@@ -1265,23 +1279,30 @@ int BPFtrace::spawn_child(const std::vector<std::string>& args)
     if (prctl(PR_SET_PDEATHSIG, SIGTERM))
       perror("prctl(PR_SET_PDEATHSIG)");
 
+    // wait until the write-side of the pipe is closed
+    close(pipefds[1]);
+    char b;
+    while (read(pipefds[0], &b, 1) != 0)
+      ;
+    close(pipefds[0]);
+
     if (execve(argv[0], argv, environ))
     {
       perror("execve");
-      return -1;
+      return std::make_pair(-1, -1);
     }
   }
-  else if (ret > 0)
-  {
-    return ret;
-  }
-  else
+
+  close(pipefds[0]);
+
+  if (ret < 0)
   {
     perror("fork");
-    return -1;
+    close(pipefds[1]);
+    pipefds[1] = -1;
   }
 
-  return -1;  // silence end of control compiler warning
+  return std::make_pair(ret, pipefds[1]);
 }
 
 std::string BPFtrace::hist_index_label(int power)
